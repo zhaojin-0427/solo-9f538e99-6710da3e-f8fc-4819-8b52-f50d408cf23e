@@ -474,6 +474,17 @@ CREATE TABLE IF NOT EXISTS edition (
     source_draft_id INTEGER,
     vtt_blob BLOB NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS stitch_preview (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lock_version INTEGER NOT NULL,
+    vtt_raw TEXT NOT NULL,
+    cuts_json TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    segment_filenames TEXT NOT NULL DEFAULT '[]',
+    csv_filename TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -738,6 +749,118 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
         conn.execute("UPDATE project SET lock_version = lock_version + 1 WHERE id = 1")
         conn.execute("COMMIT")
         return version_no
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# 分段拼接预览
+# ---------------------------------------------------------------------------
+
+
+class StalePreview(RuntimeError):
+    """拼接预览已过期：预览后草稿被更换或已发布。"""
+
+
+def save_stitch_preview(
+    conn: sqlite3.Connection,
+    vtt_raw: str,
+    cuts: list[Cut],
+    payload: dict,
+    *,
+    segment_filenames: Optional[list[str]] = None,
+    csv_filename: str = "",
+) -> int:
+    """暂存一次拼接预览，记录保存时的锁版本用于确认时的新鲜度检查。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        version = lock_version(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO stitch_preview
+                (lock_version, vtt_raw, cuts_json, payload_json,
+                 segment_filenames, csv_filename, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version,
+                vtt_raw,
+                json.dumps([cut.__dict__ for cut in cuts], ensure_ascii=False),
+                json.dumps(payload, ensure_ascii=False),
+                json.dumps(segment_filenames or [], ensure_ascii=False),
+                csv_filename,
+                _utc_now(),
+            ),
+        )
+        conn.execute("COMMIT")
+        return cursor.lastrowid
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+
+def load_stitch_preview(
+    conn: sqlite3.Connection, preview_id: int
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM stitch_preview WHERE id = ?", (preview_id,)
+    ).fetchone()
+
+
+def confirm_stitch_preview(
+    conn: sqlite3.Connection, preview_id: int
+) -> int:
+    """确认预览：锁版本未变才用合成字幕与剪辑表建立新草稿。
+
+    预览后若草稿被更换或发布（锁版本递增），抛出 :class:`StalePreview`，
+    提示重新预览；写入在事务内完成，失败时现有草稿原样保留。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT * FROM stitch_preview WHERE id = ?", (preview_id,)
+        ).fetchone()
+        if row is None:
+            raise StalePreview("拼接预览不存在，请重新上传并预览")
+        if row["lock_version"] != lock_version(conn):
+            raise StalePreview("草稿在预览后已被更换或发布，请重新预览后再确认")
+        cuts = _parse_cuts(row["cuts_json"])
+        cues = parse_vtt(row["vtt_raw"])
+        names = json.loads(row["segment_filenames"])
+        vtt_filename = "+".join(names[:3]) + (
+            "…" if len(names) > 3 else ""
+        ) or "stitched.vtt"
+        previous = conn.execute(
+            "SELECT id FROM draft ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        previous_decisions = (
+            decision_rows(conn, previous["id"]) if previous is not None else {}
+        )
+        fragments = compute_occurrences(cuts, cues)
+        conn.execute("UPDATE project SET lock_version = lock_version + 1 WHERE id = 1")
+        revision = lock_version(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO draft
+                (revision, vtt_raw, cuts_json, vtt_filename, csv_filename, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                revision,
+                row["vtt_raw"],
+                row["cuts_json"],
+                vtt_filename,
+                row["csv_filename"],
+                _utc_now(),
+            ),
+        )
+        draft_id = cursor.lastrowid
+        _insert_decisions(
+            conn, draft_id, inherited_decisions(fragments, previous_decisions)
+        )
+        conn.execute("COMMIT")
+        return draft_id
     except Exception:
         conn.execute("ROLLBACK")
         raise

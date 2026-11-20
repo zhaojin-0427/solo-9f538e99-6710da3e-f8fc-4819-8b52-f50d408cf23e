@@ -1,33 +1,57 @@
-"""网页流程测试：上传、预览、校订、发布、下载、过期页与失败原子性。"""
+"""网页流程测试：多段上传、拼接预览、确认建稿、校订、发布、过期与失败保留。"""
 from __future__ import annotations
 
+import io
 import re
+import sqlite3
 
 import pytest
 
 from app import core
 from app.app import create_app
 
-VTT = """WEBVTT
+# ---------------------------------------------------------------------------
+# 分段夹具（段内时码，每段从 0 开始）
+# ---------------------------------------------------------------------------
+
+SEG1 = """WEBVTT
 
 1
-00:00:01.000 --> 00:00:05.000
-第一句原话。
+00:00:01.000 --> 00:00:02.000
+第一句。
 
 2
-00:00:05.000 --> 00:00:10.000
-第二句原话，比较长，
-分成两行。
+00:00:05.000 --> 00:00:06.000
+交接句。
 
 3
-00:00:10.000 --> 00:00:15.000
-第三句原话。
+00:00:07.000 --> 00:00:07.500
+段一尾。
 """
 
+SEG2 = """WEBVTT
+
+1
+00:00:00.000 --> 00:00:01.000
+交接句。
+
+2
+00:00:02.000 --> 00:00:03.000
+段二头。
+
+3
+00:00:05.000 --> 00:00:06.000
+段二尾。
+"""
+
+# 剪辑表作用于拼接后的原片时间轴（0–11000 毫秒）。
 CSV = """片段号,原片起毫秒,原片止毫秒
-A,00:00:01.000,00:00:05.000
-B,00:00:03.000,00:00:12.000
-C,00:00:12.000,00:00:15.000
+A,1000,5500
+B,5500,11000
+"""
+
+CSV_NO_CUTS = """片段号,原片起毫秒,原片止毫秒
+A,1000,11000
 """
 
 
@@ -43,269 +67,320 @@ def client(app):
     return app.test_client()
 
 
-def upload(client, vtt=VTT, csv=CSV):
-    response = client.post(
-        "/upload",
-        data={
-            "vtt": (open_bytes(vtt), "interview.vtt"),
-            "csv": (open_bytes(csv), "edit.csv"),
-        },
+def raw(text: str):
+    return io.BytesIO(text.encode("utf-8"))
+
+
+def stitch_form(
+    client,
+    segments=(("a.vtt", SEG1, "0", "8000"), ("b.vtt", SEG2, "5000", "12000")),
+    csv_text=CSV,
+):
+    data = {}
+    for name, content, _start, _end in segments:
+        data.setdefault("vtt", []).append((raw(content), name))
+    data["start_ms"] = [item[2] for item in segments]
+    data["end_ms"] = [item[3] for item in segments]
+    data["csv"] = (raw(csv_text), "edit.csv")
+    return client.post(
+        "/stitch",
+        data=data,
         content_type="multipart/form-data",
         follow_redirects=False,
     )
-    assert response.status_code == 302, response.data.decode()
+
+
+def preview_id_of(response) -> int:
+    match = re.search(r"/stitch/preview/(\d+)", response.headers["Location"])
+    assert match, response.headers["Location"]
+    return int(match.group(1))
+
+
+def draft_id_of(response) -> int:
     match = re.search(r"/draft/(\d+)", response.headers["Location"])
     assert match, response.headers["Location"]
     return int(match.group(1))
 
 
-def open_bytes(text: str):
-    import io
-
-    return io.BytesIO(text.encode("utf-8"))
-
-
-def draft_form(client, draft_id):
-    """读取草稿页，解析出隐藏的版本号与每个剪口出现的输入项。"""
-    page = client.get(f"/draft/{draft_id}")
-    html = page.data.decode()
-    revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
-    return page, revision, html
+class TestIndex:
+    def test_homepage_offers_multi_segment_form(self, client):
+        html = client.get("/").data.decode()
+        assert "2～12" in html
+        assert 'name="vtt"' in html
+        assert 'name="start_ms"' in html
+        assert 'name="end_ms"' in html
+        assert 'name="csv"' in html
 
 
-def occurrence_fields(html):
-    return sorted({int(m) for m in re.findall(r'name="status:(\d+)"', html)})
+class TestStitchUpload:
+    def test_valid_upload_redirects_to_preview(self, client):
+        response = stitch_form(client)
+        assert response.status_code == 302
+        assert "/stitch/preview/" in response.headers["Location"]
 
-
-def fill(client, draft_id, decider, publish=False):
-    page, revision, html = draft_form(client, draft_id)
-    data = {"revision": revision}
-    for index in occurrence_fields(html):
-        status, text = decider(index)
-        data[f"status:{index}"] = status
-        data[f"text:{index}"] = text
-    url = f"/draft/{draft_id}/" + ("publish" if publish else "save")
-    return client.post(url, data=data, follow_redirects=False)
-
-
-class TestUploadAndPreview:
-    def test_upload_creates_draft_and_previews_both_timelines(self, client):
-        draft_id = upload(client)
-        page, revision, html = draft_form(client, draft_id)
+    def test_preview_shows_handoff_and_original_timeline(self, client):
+        preview_id = preview_id_of(stitch_form(client))
+        page = client.get(f"/stitch/preview/{preview_id}")
         assert page.status_code == 200
-        # 每一次出现都同时给出原片与节选时码
+        html = page.data.decode()
+        # 各处采用的交接字幕
+        assert "交接句。" in html
+        # 交接的前段原片时码与后段换算时码
+        assert "00:00:05.000" in html and "00:00:06.000" in html
+        # 合成稿原片时码
+        assert "第一句。" in html and "段二头。" in html and "段二尾。" in html
+        # 偏差总和为 0
+        assert "0 毫秒" in html
+
+    def test_stitched_vtt_drops_duplicate_handoff(self, client):
+        preview_id = preview_id_of(stitch_form(client))
+        html = client.get(f"/stitch/preview/{preview_id}").data.decode()
+        # 交接句只保留一次（前段版本），段一尾因位于重叠区但不交接仍保留
+        assert html.count("交接句。") >= 1
+        # 确认建稿后合成 VTT 中交接句仅一条
+        response = client.post(f"/stitch/preview/{preview_id}/confirm")
+        draft_id = draft_id_of(response)
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            row = core.load_draft(conn, draft_id)
+            cues = core.parse_vtt(row["vtt_raw"])
+        finally:
+            conn.close()
+        texts = [cue.text for cue in cues]
+        assert texts == ["第一句。", "交接句。", "段二头。", "段二尾。"]
+        handoff = cues[1]
+        assert (handoff.start_ms, handoff.end_ms) == (5000, 6000)
+
+    def test_too_few_segments_rejected(self, client):
+        follow = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw(SEG1), "a.vtt")],
+                "start_ms": ["0"],
+                "end_ms": ["8000"],
+                "csv": (raw(CSV), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert "2～12" in follow.data.decode()
+
+    def test_non_increasing_ranges_rejected(self, client):
+        follow = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw(SEG1), "a.vtt"), (raw(SEG2), "b.vtt")],
+                "start_ms": ["5000", "0"],
+                "end_ms": ["12000", "8000"],
+                "csv": (raw(CSV), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert "起点" in follow.data.decode()
+
+    def test_non_overlapping_adjacency_rejected(self, client):
+        follow = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw(SEG1), "a.vtt"), (raw(SEG2), "b.vtt")],
+                "start_ms": ["0", "8000"],
+                "end_ms": ["8000", "12000"],
+                "csv": (raw(CSV), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert "重叠" in follow.data.decode()
+
+    def test_missing_end_ms_rejected(self, client):
+        follow = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw(SEG1), "a.vtt"), (raw(SEG2), "b.vtt")],
+                "start_ms": ["0", "5000"],
+                "end_ms": ["8000", ""],
+                "csv": (raw(CSV), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert "起止毫秒" in follow.data.decode()
+
+    def test_bad_vtt_rejected(self, client):
+        follow = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw("not vtt"), "a.vtt"), (raw(SEG2), "b.vtt")],
+                "start_ms": ["0", "5000"],
+                "end_ms": ["8000", "12000"],
+                "csv": (raw(CSV), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert "WebVTT" in follow.data.decode()
+
+    def test_bad_csv_rejected(self, client):
+        follow = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw(SEG1), "a.vtt"), (raw(SEG2), "b.vtt")],
+                "start_ms": ["0", "5000"],
+                "end_ms": ["8000", "12000"],
+                "csv": (raw("片段号,起,止\nA,1000,1000\n"), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        assert "剪辑 CSV" in follow.data.decode()
+
+    def test_no_solution_renders_problem_page_and_keeps_draft(self, client):
+        # 两段没有任何同文字幕
+        other = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n完全不同。\n"
+        response = client.post(
+            "/stitch",
+            data={
+                "vtt": [(raw(SEG1), "a.vtt"), (raw(other), "b.vtt")],
+                "start_ms": ["0", "5000"],
+                "end_ms": ["8000", "12000"],
+                "csv": (raw(CSV), "edit.csv"),
+            },
+            content_type="multipart/form-data",
+        )
+        assert response.status_code == 422
+        html = response.data.decode()
+        assert "未能接通全期" in html
+        assert "有问题" in html
+        # 未建立任何草稿
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            assert conn.execute("SELECT COUNT(*) FROM draft").fetchone()[0] == 0
+        finally:
+            conn.close()
+
+
+class TestConfirmAndDraft:
+    def test_confirm_creates_draft_and_opens_review(self, client):
+        preview_id = preview_id_of(stitch_form(client))
+        response = client.post(f"/stitch/preview/{preview_id}/confirm")
+        assert response.status_code == 302
+        draft_id = draft_id_of(response)
+        page = client.get(f"/draft/{draft_id}")
+        assert page.status_code == 200
+        html = page.data.decode()
+        # 剪口校订页给出原片与节选时码
         assert "原片" in html and "节选" in html
-        assert "00:00:01.000" in html  # 原片起点
-        assert "00:00:00.000" in html  # 节选起点
-        # 片段 B 的节选偏移 = A 的 4s
-        assert "00:00:04.000" in html
-        # 剪口截断的条目需要录入
-        assert occurrence_fields(html)
 
-    def test_bad_upload_reports_error(self, client):
-        response = client.post(
-            "/upload",
-            data={
-                "vtt": (open_bytes("not a vtt"), "x.vtt"),
-                "csv": (open_bytes(CSV), "x.csv"),
-            },
-            content_type="multipart/form-data",
-            follow_redirects=True,
+    def test_confirm_with_cut_cues_then_publish(self, client):
+        preview_id = preview_id_of(stitch_form(client, csv_text=CSV))
+        draft_id = draft_id_of(
+            client.post(f"/stitch/preview/{preview_id}/confirm")
         )
-        assert response.status_code == 200
-        assert "上传失败" in response.data.decode()
+        html = client.get(f"/draft/{draft_id}").data.decode()
+        fields = sorted({int(m) for m in re.findall(r'name="status:(\d+)"', html)})
+        assert fields  # 剪辑表在 5500 处切开了交接句，存在剪口
+        revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"校订{index}"
+        published = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert published.status_code == 302
+        assert "/editions/1" in published.headers["Location"]
+        body = client.get("/editions/1/download").data.decode()
+        assert body.startswith("WEBVTT")
+        assert "校订" in body
 
-    def test_duplicate_fragment_number_rejected(self, client):
-        bad_csv = "片段号,原片起毫秒,原片止毫秒\nA,0,1000\nA,1000,2000\n"
-        response = client.post(
-            "/upload",
-            data={
-                "vtt": (open_bytes(VTT), "x.vtt"),
-                "csv": (open_bytes(bad_csv), "x.csv"),
-            },
-            content_type="multipart/form-data",
-            follow_redirects=True,
+    def test_publish_blocked_until_cuts_handled(self, client):
+        preview_id = preview_id_of(stitch_form(client))
+        draft_id = draft_id_of(
+            client.post(f"/stitch/preview/{preview_id}/confirm")
         )
-        assert "片段号重复" in response.data.decode()
-
-
-class TestReviewAndPublish:
-    def test_cannot_publish_until_every_cut_handled(self, client):
-        draft_id = upload(client)
-        _, revision, html = draft_form(client, draft_id)
-        fields = occurrence_fields(html)
-        assert fields
-        # 只处理第一处就发布会失败
-        data = {"revision": revision, f"status:{fields[0]}": "delete"}
-        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        html = client.get(f"/draft/{draft_id}").data.decode()
+        revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
+        response = client.post(
+            f"/draft/{draft_id}/publish", data={"revision": revision}
+        )
         assert response.status_code == 422
         assert "未处理" in response.data.decode()
-        # 失败不产生新版
-        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
 
-    def test_full_publish_and_download(self, client):
-        draft_id = upload(client)
-        response = fill(
-            client,
-            draft_id,
-            lambda index: ("keep", f"保留文字{index}"),
-            publish=True,
+    def test_whole_only_csv_publishes_without_decisions(self, client):
+        preview_id = preview_id_of(stitch_form(client, csv_text=CSV_NO_CUTS))
+        draft_id = draft_id_of(
+            client.post(f"/stitch/preview/{preview_id}/confirm")
+        )
+        html = client.get(f"/draft/{draft_id}").data.decode()
+        revision = re.search(r'name="revision" value="(\d+)"', html).group(1)
+        response = client.post(
+            f"/draft/{draft_id}/publish", data={"revision": revision}
         )
         assert response.status_code == 302
-        location = response.headers["Location"]
-        assert "/editions/1" in location
-
-        download = client.get("/editions/1/download")
-        assert download.status_code == 200
-        assert download.headers["Content-Type"].startswith("text/vtt")
-        body = download.data.decode("utf-8")
-        assert body.startswith("WEBVTT")
-        assert body.endswith("\n")
-
-        parsed = core.parse_vtt(body)
-        texts = [cue.text for cue in parsed]
-        assert "第一句原话。" in texts  # 整条保留沿用正文
-        # 剪口被截断的每一次出现都按各自录入的文字输出
-        assert "保留文字1" in texts
-        assert "保留文字3" in texts
-        assert "保留文字4" in texts
-        assert len([t for t in texts if t.startswith("保留文字")]) == 3
-
-    def test_deleted_cut_occurrence_absent_from_output(self, client):
-        draft_id = upload(client)
-        fill(client, draft_id, lambda index: ("delete", ""), publish=True)
         body = client.get("/editions/1/download").data.decode()
-        parsed = core.parse_vtt(body)
-        # 被删掉的剪口不出现，但整条保留的仍在
-        assert "第一句原话。" in [cue.text for cue in parsed]
-        assert body.count("-->") == len(parsed)
-
-    def test_publish_twice_from_same_page_is_rejected(self, client):
-        draft_id = upload(client)
-        _, revision, html = draft_form(client, draft_id)
-        data = {"revision": revision}
-        for index in occurrence_fields(html):
-            data[f"status:{index}"] = "delete"
-        first = client.post(f"/draft/{draft_id}/publish", data=data)
-        assert first.status_code == 302
-        second = client.post(f"/draft/{draft_id}/publish", data=data)
-        assert second.status_code == 409
-        assert "过期" in second.data.decode()
+        for text in ("第一句。", "交接句。", "段二头。", "段二尾。"):
+            assert text in body
 
 
-class TestStaleDraft:
-    def test_old_page_rejected_after_new_upload(self, client):
-        old_id = upload(client)
-        _, old_revision, old_html = draft_form(client, old_id)
-        fields = occurrence_fields(old_html)
+class TestStalePreview:
+    def _two_previews(self, client):
+        first = preview_id_of(stitch_form(client))
+        second = preview_id_of(stitch_form(client))
+        return first, second
 
-        new_id = upload(client, csv=CSV.replace("00:00:12.000", "00:00:11.000"))
-        assert new_id != old_id
+    def test_confirm_after_newer_preview_prompts_re_preview(self, client):
+        first, second = self._two_previews(client)
+        # 确认第二个预览会推进锁版本，使第一个预览过期
+        assert client.post(f"/stitch/preview/{second}/confirm").status_code == 302
+        stale = client.post(f"/stitch/preview/{first}/confirm")
+        assert stale.status_code == 409
+        assert "重新预览" in stale.data.decode()
 
-        data = {"revision": old_revision}
-        for index in fields:
-            data[f"status:{index}"] = "delete"
-        response = client.post(f"/draft/{old_id}/save", data=data)
-        assert response.status_code == 409
-        assert "刷新" in response.data.decode()
+    def test_preview_page_flags_stale(self, client):
+        first, second = self._two_previews(client)
+        client.post(f"/stitch/preview/{second}/confirm")
+        page = client.get(f"/stitch/preview/{first}")
+        assert page.status_code == 409
+        assert "预览已过期" in page.data.decode()
 
-    def test_old_page_rejected_on_publish(self, client):
-        old_id = upload(client)
-        _, old_revision, old_html = draft_form(client, old_id)
-        fields = occurrence_fields(old_html)
-        upload(client)  # 更换剪辑表
-
-        data = {"revision": old_revision}
-        for index in fields:
-            data[f"status:{index}"] = "delete"
-        response = client.post(f"/draft/{old_id}/publish", data=data)
-        assert response.status_code == 409
-        assert "过期" in response.data.decode()
-        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
-
-
-class TestRecomputeAndInheritance:
-    def test_new_csv_recomputes_excerpt_times(self, client):
-        draft_id = upload(client)
-        _, _, old_html = draft_form(client, draft_id)
-        # 原表：A 4s + B 9s => C 的节选从 13s 开始
-        assert "00:00:13.000" in old_html
-        fill(client, draft_id, lambda index: ("keep", f"校订{index}"), publish=False)
-        # 把 B 剪短 1 秒：C 的节选时码整体前移 1 秒
-        new_csv = """片段号,原片起毫秒,原片止毫秒
-A,00:00:01.000,00:00:05.000
-B,00:00:03.000,00:00:11.000
-C,00:00:12.000,00:00:15.000
-"""
-        new_id = upload(client, csv=new_csv)
-        _, _, html = draft_form(client, new_id)
-        # A 4s + B 8s = 12s，C 的节选为 12s–15s
-        assert "00:00:12.000" in html
-        assert "00:00:15.000" in html
-        assert "00:00:13.000" not in html
-
-    def test_inheritance_requires_fragment_text_and_range(self, client):
-        review_csv = """片段号,原片起毫秒,原片止毫秒
-A,00:00:01.000,00:00:05.000
-B,00:00:03.000,00:00:12.000
-C,00:00:12.000,00:00:15.000
-"""
-        old_id = upload(client, csv=review_csv)
-        _, revision, html = draft_form(client, old_id)
-        fields = occurrence_fields(html)
-        # A/C 各有一处剪口，B 的起止两端各截断一条字幕
-        assert len(fields) == 3
-        data = {"revision": revision}
-        for index in fields:
-            data[f"status:{index}"] = "keep"
-            data[f"text:{index}"] = f"旧校订{index}"
-        assert client.post(f"/draft/{old_id}/save", data=data).status_code == 302
-
-        # 同一份剪辑表：三处剪口全部沿用
-        same_id = upload(client, csv=review_csv)
-        same_html = draft_form(client, same_id)[2]
-        assert same_html.count("沿用上一版校订") == 3
-        assert "旧校订" in same_html
-
-        # 只改变 B 的止毫秒：B 里结束端被截的那条原片范围变了，不再沿用
-        changed = review_csv.replace(
-            "00:00:03.000,00:00:12.000", "00:00:03.000,00:00:11.000"
+    def test_publish_bumps_lock_and_duplicate_confirm_rejected(self, client):
+        preview_id = preview_id_of(stitch_form(client, csv_text=CSV_NO_CUTS))
+        draft_id = draft_id_of(
+            client.post(f"/stitch/preview/{preview_id}/confirm")
         )
-        changed_id = upload(client, csv=changed)
-        changed_html = draft_form(client, changed_id)[2]
-        assert changed_html.count("沿用上一版校订") == 2
+        revision = re.search(
+            r'name="revision" value="(\d+)"',
+            client.get(f"/draft/{draft_id}").data.decode(),
+        ).group(1)
+        client.post(f"/draft/{draft_id}/publish", data={"revision": revision})
+        # 发布后同一预览再次确认必须被拒绝
+        again = client.post(f"/stitch/preview/{preview_id}/confirm")
+        assert again.status_code == 409
+        assert "重新预览" in again.data.decode()
 
-    def test_changed_original_text_loses_inheritance(self, client):
-        old_csv = "片段号,原片起毫秒,原片止毫秒\nA,00:00:03.000,00:00:08.000\n"
-        old_id = upload(client, csv=old_csv)
-        revision = draft_form(client, old_id)[1]
-        fields = occurrence_fields(draft_form(client, old_id)[2])
-        assert len(fields) == 2  # cue1 起端截断、cue2 末端截断
-        data = {"revision": revision}
-        for index in fields:
-            data[f"status:{index}"] = "keep"
-            data[f"text:{index}"] = f"旧校订{index}"
-        client.post(f"/draft/{old_id}/save", data=data)
 
-        # 改掉其中一条原字幕的文字：只有这一条失去沿用
-        new_vtt = VTT.replace("第二句原话，比较长，", "第二句原话，改过，")
-        new_id = upload(client, csv=old_csv, vtt=new_vtt)
-        new_html = draft_form(client, new_id)[2]
-        assert new_html.count("沿用上一版校订") == 1
+class TestWriteFailure:
+    def test_failed_confirm_keeps_existing_draft(self, client, monkeypatch):
+        preview_id = preview_id_of(stitch_form(client, csv_text=CSV_NO_CUTS))
+        # 先成功建立一份草稿
+        existing_id = draft_id_of(
+            client.post(f"/stitch/preview/{preview_id}/confirm")
+        )
 
-    def test_same_span_taken_twice_needs_two_entries(self, client):
-        csv = """片段号,原片起毫秒,原片止毫秒
-A,00:00:03.000,00:00:12.000
-A2,00:00:03.000,00:00:12.000
-"""
-        draft_id = upload(client, csv=csv)
-        _, revision, html = draft_form(client, draft_id)
-        fields = occurrence_fields(html)
-        # 两段相同的原片范围各出现一次，需分别处理
-        assert len(fields) >= 2
-        data = {"revision": revision, f"status:{fields[0]}": "delete"}
-        response = client.post(f"/draft/{draft_id}/publish", data=data)
-        assert response.status_code == 422
+        def boom(*_args, **_kwargs):
+            raise sqlite3.OperationalError("simulated disk failure")
+
+        monkeypatch.setattr(core, "confirm_stitch_preview", boom)
+        response = client.post(f"/stitch/preview/{preview_id}/confirm")
+        assert response.status_code == 302  # 回到工作台并提示
+        follow = client.get(response.headers["Location"], follow_redirects=True)
+        assert "写入失败" in follow.data.decode()
+        # 现有草稿仍然可用，未被破坏
+        conn = core.connect(client.application.config["DATABASE"])
+        try:
+            assert core.load_draft(conn, existing_id) is not None
+            assert conn.execute("SELECT COUNT(*) FROM draft").fetchone()[0] == 1
+        finally:
+            conn.close()
 
 
 class TestPersistence:
@@ -314,33 +389,19 @@ class TestPersistence:
         first = create_app(db)
         first.config.update(TESTING=True)
         client = first.test_client()
-        draft_id = upload(client)
-        fill(client, draft_id, lambda index: ("delete", ""), publish=True)
+        preview_id = preview_id_of(stitch_form(client, csv_text=CSV_NO_CUTS))
+        draft_id = draft_id_of(
+            client.post(f"/stitch/preview/{preview_id}/confirm")
+        )
+        revision = re.search(
+            r'name="revision" value="(\d+)"',
+            client.get(f"/draft/{draft_id}").data.decode(),
+        ).group(1)
+        client.post(f"/draft/{draft_id}/publish", data={"revision": revision})
         expected = client.get("/editions/1/download").data
 
-        second = create_app(db)  # 模拟重启
+        second = create_app(db)
         second.config.update(TESTING=True)
         again = second.test_client().get("/editions/1/download")
         assert again.status_code == 200
         assert again.data == expected
-
-    def test_failed_publish_leaves_no_version(self, tmp_path):
-        db = str(tmp_path / "atomic.db")
-        application = create_app(db)
-        application.config.update(TESTING=True)
-        client = application.test_client()
-        draft_id = upload(client)
-        _, revision, html = draft_form(client, draft_id)
-        fields = occurrence_fields(html)
-        data = {"revision": revision}
-        for index in fields[:-1]:
-            data[f"status:{index}"] = "delete"
-        # 最后一处留空，发布应被拒绝
-        response = client.post(f"/draft/{draft_id}/publish", data=data)
-        assert response.status_code == 422
-
-        conn = core.connect(db)
-        try:
-            assert core.get_edition(conn, 1) is None
-        finally:
-            conn.close()

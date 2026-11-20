@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}拼接失败 · 口述史馆{% endblock %}
+{% block content %}
+<section class="panel">
+  <h1>分段拼接未能接通全期</h1>
+  <div class="banner error">
+    <strong>{{ result.reason }}</strong>
+  </div>
+  <p>当前草稿已原样保留，未建立新草稿。请核对标出的分段后重新上传。</p>
+
+  <h2>分段情况</h2>
+  <table>
+    <thead><tr><th>段号</th><th>文件</th><th>原片起</th><th>原片止</th><th>字幕数</th><th>状态</th></tr></thead>
+    <tbody>
+      {% for seg in result.segments %}
+      <tr class="{{ 'problem-row' if (seg.order + 1) in result.problem_segments else '' }}">
+        <td>第 {{ seg.order + 1 }} 段</td>
+        <td>{{ seg.filename }}</td>
+        <td class="mono">{{ seg.start_ms | ts }}</td>
+        <td class="mono">{{ seg.end_ms | ts }}</td>
+        <td>{{ seg.cues | length }}</td>
+        <td>
+          {% if (seg.order + 1) in result.problem_segments %}
+          <span class="chip pending">有问题</span>
+          {% else %}
+          <span class="chip">正常</span>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">
+    有问题的分段：
+    {% for no in result.problem_segments %}第 {{ no }} 段{% if not loop.last %}、{% endif %}{% else %}无{% endfor %}
+  </p>
+  <p><a class="button primary" href="{{ url_for('index') }}">回到工作台重新上传</a></p>
+</section>
+{% endblock %}

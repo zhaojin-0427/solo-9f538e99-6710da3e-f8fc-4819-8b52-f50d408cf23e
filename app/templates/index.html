@@ -3,22 +3,27 @@
 {% block content %}
 <section class="panel">
   <h1>口述史馆 · 检索字幕</h1>
-  <p class="lede">上传单期原片的 WebVTT 与剪辑 CSV，按行序拼接片段，逐次校订被剪口截断的字幕，发布后按版号下载完整 WebVTT。</p>
+  <p class="lede">按原片顺序上传 2～12 份分段转写（段内时码 WebVTT），填写各段原片起止毫秒并选择剪辑 CSV。系统在相邻段重叠区内按同文字幕接通全期，预览确认后建立新草稿，再逐次校订剪口字幕。</p>
 </section>
 
 <section class="panel">
-  <h2>上传单期原片</h2>
-  <form method="post" action="{{ url_for('upload') }}" enctype="multipart/form-data" class="upload-form">
-    <label>
-      <span>原片 WebVTT</span>
-      <input type="file" name="vtt" accept=".vtt,text/vtt" required>
-    </label>
+  <h2>分段转写拼接</h2>
+  <form method="post" action="{{ url_for('stitch_upload') }}" enctype="multipart/form-data"
+        class="upload-form" id="stitch-form">
+    <div id="segment-rows" class="segment-rows"></div>
+    <div class="row-actions">
+      <button type="button" class="button" id="add-segment">增加一段</button>
+      <span class="hint" id="segment-count-hint"></span>
+    </div>
     <label>
       <span>剪辑 CSV</span>
       <input type="file" name="csv" accept=".csv,text/csv" required>
     </label>
-    <p class="hint">CSV 每行：片段号、原片起毫秒、原片止毫秒；行序即拼接顺序，同一时段可被多个片段号重复取用。</p>
-    <button type="submit" class="primary">建立草稿</button>
+    <p class="hint">
+      各段起点、终点都须逐段递增，相邻段要有重叠；段内字幕只允许纯文本，按时码排列，不重叠也不越界。
+      交接以重叠区内完整出现的同文字幕为准，换算到原片后起点、终点偏差各不超过 250 毫秒。
+    </p>
+    <button type="submit" class="primary">预览拼接方案</button>
   </form>
 </section>
 
@@ -59,4 +64,55 @@
   <p class="hint">尚无已发布版本。</p>
   {% endif %}
 </section>
+
+<script>
+(function () {
+  var MIN = 2, MAX = 12;
+  var box = document.getElementById('segment-rows');
+  var addBtn = document.getElementById('add-segment');
+  var hint = document.getElementById('segment-count-hint');
+
+  function rowTemplate(no) {
+    var wrap = document.createElement('div');
+    wrap.className = 'segment-row panel';
+    wrap.innerHTML =
+      '<header><strong>第 ' + no + ' 段</strong>' +
+      '<button type="button" class="button remove-segment">移除</button></header>' +
+      '<label><span>分段 WebVTT（段内时码）</span>' +
+      '<input type="file" name="vtt" accept=".vtt,text/vtt" required></label>' +
+      '<div class="ms-pair">' +
+      '<label><span>原片起毫秒</span>' +
+      '<input type="text" name="start_ms" inputmode="numeric" required placeholder="如 0 或 00:00:00.000"></label>' +
+      '<label><span>原片止毫秒</span>' +
+      '<input type="text" name="end_ms" inputmode="numeric" required placeholder="如 60000"></label>' +
+      '</div>';
+    return wrap;
+  }
+
+  function renumber() {
+    var rows = box.querySelectorAll('.segment-row');
+    rows.forEach(function (row, i) {
+      row.querySelector('header strong').textContent = '第 ' + (i + 1) + ' 段';
+    });
+    hint.textContent = '已填 ' + rows.length + ' 段（允许 ' + MIN + '～' + MAX + ' 段）';
+    addBtn.disabled = rows.length >= MAX;
+  }
+
+  addBtn.addEventListener('click', function () {
+    if (box.querySelectorAll('.segment-row').length >= MAX) { return; }
+    box.appendChild(rowTemplate(box.querySelectorAll('.segment-row').length + 1));
+    renumber();
+  });
+
+  box.addEventListener('click', function (event) {
+    if (!event.target.classList.contains('remove-segment')) { return; }
+    if (box.querySelectorAll('.segment-row').length <= MIN) { return; }
+    event.target.closest('.segment-row').remove();
+    renumber();
+  });
+
+  for (var i = 0; i < MIN; i += 1) { box.appendChild(rowTemplate(i + 1)); }
+  renumber();
+})();
+</script>
 {% endblock %}

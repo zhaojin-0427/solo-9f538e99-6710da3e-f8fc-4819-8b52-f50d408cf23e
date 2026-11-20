@@ -141,3 +141,17 @@ pre.vtt {
   font-family: ui-monospace, "SFMono-Regular", Menlo, monospace;
   font-size: .85rem;
 }
+
+/* 分段拼接 */
+.segment-rows { display: grid; gap: .7rem; }
+.segment-row { padding: .9rem 1rem; margin: 0; background: #fbfaf7; }
+.segment-row header { display: flex; justify-content: space-between; align-items: center; margin-bottom: .5rem; }
+.segment-row .ms-pair { display: flex; gap: .8rem; flex-wrap: wrap; }
+.segment-row .ms-pair label { flex: 1 1 14rem; }
+.row-actions { display: flex; align-items: center; gap: .8rem; }
+.cue-text { white-space: pre-wrap; }
+.vtt-details { margin-top: .8rem; }
+.problem-row { background: #fbe8e8; }
+.problem-row td:first-child { border-left: 3px solid var(--error); }
+.mono.ok { color: var(--ok); }
+.mono.warn { color: var(--warn); }

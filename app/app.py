@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from pathlib import Path
 
@@ -18,7 +19,8 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-from . import core
+from . import core, stitch
+from .stitch import MAX_SEGMENTS, MIN_SEGMENTS
 
 DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "oral_history.db")
 
@@ -69,49 +71,89 @@ def create_app(database_path: str | None = None) -> Flask:
             "index.html", draft=draft_info, editions=core.list_editions(conn)
         )
 
-    @app.post("/upload")
-    def upload():
-        vtt_file = request.files.get("vtt")
-        csv_file = request.files.get("csv")
-        if vtt_file is None or not vtt_file.filename:
-            flash("请选择单期原片的 WebVTT 文件。", "error")
-            return redirect(url_for("index"))
-        if csv_file is None or not csv_file.filename:
-            flash("请选择剪辑 CSV 文件。", "error")
+    @app.post("/stitch")
+    def stitch_upload():
+        uploads, csv_raw, csv_name, error = _read_segment_form()
+        if error is not None:
+            flash(error, "error")
             return redirect(url_for("index"))
         try:
-            vtt_raw = vtt_file.read().decode("utf-8-sig")
-        except UnicodeDecodeError:
-            flash("WebVTT 文件不是 UTF-8 编码。", "error")
-            return redirect(url_for("index"))
-        csv_bytes = csv_file.read()
-        try:
-            csv_raw = csv_bytes.decode("utf-8-sig")
-        except UnicodeDecodeError:
-            # 中文表格软件导出的 CSV 常为 GBK/GB18030。
-            try:
-                csv_raw = csv_bytes.decode("gb18030")
-            except UnicodeDecodeError:
-                flash("剪辑 CSV 不是 UTF-8 或 GB18030 编码。", "error")
-                return redirect(url_for("index"))
-
-        try:
-            cues = core.parse_vtt(vtt_raw)
             cuts = core.parse_cuts_csv(csv_raw)
         except core.ParseError as exc:
-            flash(f"上传失败：{exc}", "error")
+            flash(f"剪辑 CSV 无法使用：{exc}", "error")
+            return redirect(url_for("index"))
+        try:
+            segments = stitch.build_segments(uploads)
+            result = stitch.stitch(segments)
+        except stitch.StitchError as exc:
+            flash(f"分段拼接失败：{exc}", "error")
             return redirect(url_for("index"))
 
+        if not result.ok:
+            # 无解或最优并列：标出有问题的分段，保留当前草稿，不建新草稿。
+            return render_template(
+                "stitch_problem.html",
+                result=result,
+                csv_name=csv_name,
+            ), 422
+
+        payload = _preview_payload(result, cuts)
         conn = get_db()
-        draft_id = core.create_draft(
-            conn,
-            vtt_raw,
-            cuts,
-            cues,
-            vtt_filename=secure_filename(vtt_file.filename) or vtt_file.filename,
-            csv_filename=secure_filename(csv_file.filename) or csv_file.filename,
-        )
-        flash("已建立草稿：剪辑表中每一次出现都已重新计算节选时码。", "ok")
+        try:
+            preview_id = core.save_stitch_preview(
+                conn,
+                result.vtt_text,
+                cuts,
+                payload,
+                segment_filenames=[item["filename"] for item in uploads],
+                csv_filename=csv_name,
+            )
+        except Exception:  # 写入失败：保留现有草稿。
+            app.logger.exception("拼接预览写入失败")
+            flash("拼接预览写入失败，现有草稿已保留，请重试。", "error")
+            return redirect(url_for("index"))
+        return redirect(url_for("stitch_preview_page", preview_id=preview_id))
+
+    @app.get("/stitch/preview/<int:preview_id>")
+    def stitch_preview_page(preview_id: int):
+        conn = get_db()
+        row = core.load_stitch_preview(conn, preview_id)
+        if row is None:
+            abort(404)
+        payload = json.loads(row["payload_json"])
+        stale = row["lock_version"] != core.lock_version(conn)
+        return render_template(
+            "stitch_preview.html",
+            preview=row,
+            payload=payload,
+            stale=stale,
+        ), (409 if stale else 200)
+
+    @app.post("/stitch/preview/<int:preview_id>/confirm")
+    def stitch_confirm(preview_id: int):
+        conn = get_db()
+        row = core.load_stitch_preview(conn, preview_id)
+        if row is None:
+            abort(404)
+        try:
+            draft_id = core.confirm_stitch_preview(conn, preview_id)
+        except core.StalePreview as exc:
+            payload = json.loads(row["payload_json"])
+            return (
+                render_template(
+                    "stitch_preview.html",
+                    preview=row,
+                    payload=payload,
+                    stale=True,
+                    stale_message=str(exc),
+                ),
+                409,
+            )
+        except Exception:  # 写入失败：保留现有草稿。
+            app.logger.exception("拼接确认写入失败")
+            flash("新草稿写入失败，现有草稿已保留，请重试。", "error")
+            return redirect(url_for("index"))
+        flash("已按合成字幕与剪辑表建立新草稿，请重新校订剪口。", "ok")
         return redirect(url_for("draft_page", draft_id=draft_id))
 
     @app.get("/draft/<int:draft_id>")
@@ -229,6 +271,119 @@ def _form_revision() -> int:
         return int(request.form.get("revision", ""))
     except (TypeError, ValueError):
         abort(400, "缺少校订版本号")
+
+
+def _decode_upload(file_storage, label: str) -> str:
+    try:
+        return file_storage.read().decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise stitch.StitchError(f"{label}不是 UTF-8 编码") from exc
+
+
+def _read_segment_form() -> tuple[list[dict], str, str, Optional[str]]:
+    """解析首页多段上传表单。
+
+    成功时返回 ``(上传项, CSV 原文, CSV 文件名, None)``；
+    失败时最后一项为错误信息。
+    """
+    count = len(request.files.getlist("vtt"))
+    if not MIN_SEGMENTS <= count <= MAX_SEGMENTS:
+        return [], "", "", (
+            f"请按原片顺序上传 {MIN_SEGMENTS}～{MAX_SEGMENTS} 份转写，"
+            f"当前收到 {count} 份文件。"
+        )
+
+    vtt_files = request.files.getlist("vtt")
+    start_values = request.form.getlist("start_ms")
+    end_values = request.form.getlist("end_ms")
+    if not (len(start_values) == len(end_values) == count):
+        return [], "", "", "每一段都要填写原片起止毫秒，并各选一份 WebVTT。"
+
+    uploads: list[dict] = []
+    try:
+        for order, vtt_file in enumerate(vtt_files):
+            label = f"第 {order + 1} 段"
+            if not vtt_file.filename:
+                return [], "", "", f"{label}缺少 WebVTT 文件。"
+            start_text = start_values[order].strip()
+            end_text = end_values[order].strip()
+            if not start_text or not end_text:
+                return [], "", "", f"{label}缺少原片起止毫秒。"
+            uploads.append(
+                {
+                    "filename": secure_filename(vtt_file.filename)
+                    or vtt_file.filename,
+                    "vtt_raw": _decode_upload(vtt_file, label),
+                    "start_ms": start_text,
+                    "end_ms": end_text,
+                }
+            )
+    except stitch.StitchError as exc:
+        return [], "", "", str(exc)
+
+    csv_file = request.files.get("csv")
+    if csv_file is None or not csv_file.filename:
+        return [], "", "", "请选择剪辑 CSV 文件。"
+    csv_bytes = csv_file.read()
+    try:
+        csv_raw = csv_bytes.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        # 中文表格软件导出的 CSV 常为 GBK/GB18030。
+        try:
+            csv_raw = csv_bytes.decode("gb18030")
+        except UnicodeDecodeError:
+            return [], "", "", "剪辑 CSV 不是 UTF-8 或 GB18030 编码。"
+    csv_name = secure_filename(csv_file.filename) or csv_file.filename
+    return uploads, csv_raw, csv_name, None
+
+
+def _preview_payload(result, cuts) -> dict:
+    """组织预览页所需数据：各交接采用的字幕 + 合成稿原片时码。"""
+    handoffs = []
+    for cand in result.plan:
+        handoffs.append(
+            {
+                "adjacency": cand.adjacency,
+                "left_segment": cand.left_segment + 1,
+                "right_segment": cand.right_segment + 1,
+                "text": cand.text,
+                "left_start": cand.left_start,
+                "left_end": cand.left_end,
+                "right_start": cand.right_start,
+                "right_end": cand.right_end,
+                "start_delta": cand.start_delta,
+                "end_delta": cand.end_delta,
+                "cost": cand.cost,
+            }
+        )
+    stitched = [
+        {
+            "start_ms": cue.start_ms,
+            "end_ms": cue.end_ms,
+            "text": cue.text,
+            "segment": cue.segment + 1,
+        }
+        for cue in result.stitched
+    ]
+    segments = [
+        {
+            "order": seg.order + 1,
+            "filename": seg.filename,
+            "start_ms": seg.start_ms,
+            "end_ms": seg.end_ms,
+            "cue_count": len(seg.cues),
+        }
+        for seg in result.segments
+    ]
+    return {
+        "handoffs": handoffs,
+        "stitched": stitched,
+        "segments": segments,
+        "cuts": [cut.__dict__ for cut in cuts],
+        "total_cost": result.total_cost,
+        "cue_count": len(stitched),
+        "vtt_text": result.vtt_text,
+    }
 
 
 def _collect_changes(bundle: dict, form) -> list[dict]:

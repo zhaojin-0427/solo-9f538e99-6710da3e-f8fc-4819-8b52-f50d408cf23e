@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}拼接预览 · 口述史馆{% endblock %}
+{% block content %}
+{% if stale %}
+<div class="banner error">
+  <strong>预览已过期。</strong>
+  {{ stale_message or '草稿在预览后已被更换或发布，请重新上传分段并预览。' }}
+  <a class="button" href="{{ url_for('index') }}">回到工作台重新预览</a>
+</div>
+{% endif %}
+
+<section class="panel">
+  <h1>分段拼接预览</h1>
+  <dl class="facts">
+    <div><dt>分段</dt><dd>{{ payload.segments | length }}</dd></div>
+    <div><dt>交接</dt><dd>{{ payload.handoffs | length }}</dd></div>
+    <div><dt>合成字幕</dt><dd>{{ payload.cue_count }}</dd></div>
+    <div><dt>偏差总和</dt><dd class="ok">{{ payload.total_cost }} 毫秒</dd></div>
+  </dl>
+  <p class="hint">来源分段：
+    {% for seg in payload.segments %}
+    {{ seg.filename }}（{{ seg.start_ms | ts }}–{{ seg.end_ms | ts }}）{% if not loop.last %} · {% endif %}
+    {% endfor %}
+  </p>
+</section>
+
+<section class="panel">
+  <h2>各处采用的交接字幕</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>交接</th><th>同文字幕</th>
+        <th>前段原片时码</th><th>后段换算时码</th>
+        <th>起偏差</th><th>止偏差</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for h in payload.handoffs %}
+      <tr>
+        <td>第 {{ h.left_segment }} 段 → 第 {{ h.right_segment }} 段</td>
+        <td class="cue-text">{{ h.text }}</td>
+        <td class="mono">{{ h.left_start | ts }} – {{ h.left_end | ts }}</td>
+        <td class="mono">{{ h.right_start | ts }} – {{ h.right_end | ts }}</td>
+        <td class="mono {{ 'warn' if h.start_delta else 'ok' }}">{{ '%+d' | format(h.start_delta) }} ms</td>
+        <td class="mono {{ 'warn' if h.end_delta else 'ok' }}">{{ '%+d' | format(h.end_delta) }} ms</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="hint">交接保留前段字幕，后段从对应字幕的下一条接起；各偏差绝对值均不超过 250 毫秒。</p>
+</section>
+
+<section class="panel">
+  <h2>合成稿（原片时码）</h2>
+  <table>
+    <thead><tr><th>#</th><th>来源段</th><th>原片起</th><th>原片止</th><th>字幕正文</th></tr></thead>
+    <tbody>
+      {% for cue in payload.stitched %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>第 {{ cue.segment }} 段</td>
+        <td class="mono">{{ cue.start_ms | ts }}</td>
+        <td class="mono">{{ cue.end_ms | ts }}</td>
+        <td class="cue-text">{{ cue.text }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <details class="vtt-details">
+    <summary class="hint">查看合成 WebVTT 原文</summary>
+    <pre class="vtt">{{ payload.vtt_text }}</pre>
+  </details>
+</section>
+
+<section class="panel">
+  <h2>剪辑表（{{ payload.cuts | length }} 个片段）</h2>
+  <table>
+    <thead><tr><th>片段号</th><th>原片起毫秒</th><th>原片止毫秒</th></tr></thead>
+    <tbody>
+      {% for cut in payload.cuts %}
+      <tr><td>{{ cut.fragment_no }}</td><td class="mono">{{ cut.start_ms | ts }}</td><td class="mono">{{ cut.end_ms | ts }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<form method="post" action="{{ url_for('stitch_confirm', preview_id=preview.id) }}">
+  <div class="actions">
+    <a class="button" href="{{ url_for('index') }}">放弃，返回工作台</a>
+    <button type="submit" class="primary" {{ 'disabled' if stale }}>
+      确认并用合成字幕与剪辑表建立新草稿
+    </button>
+  </div>
+</form>
+{% endblock %}
